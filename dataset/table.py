@@ -116,7 +116,7 @@ class Table(object):
         Returns the inserted row's primary key.
         """
         row = self._sync_columns(row, ensure, types=types)
-        res = self.db.executable.execute(self.table.insert(), row)
+        res = self.db.executable.execute(self.table.insert().values(row))
         # SQLAlchemy 2.0.0b1 removes auto commit
         if hasattr(self.db.local, "tx") and self.db.local.tx:
             pass
@@ -213,11 +213,12 @@ class Table(object):
         if not len(row):
             return self.count(clause)
         stmt = self.table.update().where(clause).values(row)
-        rp = self.db.executable.execute(stmt)
-        if rp.supports_sane_rowcount():
-            return rp.rowcount
-        if return_count:
-            return self.count(clause)
+        with self.db.engine.begin() as conn:
+            rp = conn.execute(stmt)
+            if rp.supports_sane_rowcount():
+                return rp.rowcount
+            if return_count:
+                return self.count(clause)
 
     def update_many(self, rows, keys, chunk_size=1000, ensure=None, types=None):
         """Update many rows in the table at a time.
@@ -250,7 +251,8 @@ class Table(object):
                 stmt = self.table.update()\
                                  .where(and_(True, *cl))\
                                  .values({col: bindparam(col, required=False) for col in columns})
-                self.db.executable.execute(stmt, chunk)
+                with self.db.engine.begin() as conn:
+                    conn.execute(stmt, chunk)
                 chunk = []
 
     def upsert(self, row, keys, ensure=None, types=None):
@@ -299,8 +301,9 @@ class Table(object):
             return False
         clause = self._args_to_clause(filters, clauses=clauses)
         stmt = self.table.delete().where(clause)
-        rp = self.db.executable.execute(stmt)
-        return rp.rowcount > 0
+        with self.db.engine.begin() as conn:
+            rp = conn.execute(stmt)
+            return rp.rowcount > 0
 
     def _reflect_table(self):
         """Load the tables definition from the database."""
@@ -308,7 +311,7 @@ class Table(object):
             self._columns = None
             try:
                 self._table = SQLATable(
-                    self.name, self.db.metadata, schema=self.db.schema, autoload_with=self.db.engine,
+                    self.name, self.db.metadata, schema=self.db.schema, autoload_with=self.db.engine
                 )
             except NoSuchTableError:
                 self._table = None
@@ -350,15 +353,17 @@ class Table(object):
                 for column in columns:
                     if not column.name == self._primary_id:
                         self._table.append_column(column)
-                self._table.create(self.db.executable, checkfirst=True)
+                with self.db.engine.begin() as conn:
+                    self._table.create(conn, checkfirst=True)
                 self._columns = None
         elif len(columns):
             with self.db.lock:
                 self._reflect_table()
                 self._threading_warn()
-                for column in columns:
-                    if not self.has_column(column.name):
-                        self.db.op.add_column(self.name, column, self.db.schema)
+                with self.db.engine.begin() as conn:
+                    for column in columns:
+                        if not self.has_column(column.name):
+                            self.db.op.add_column(self.name, column, schema=self.db.schema)
                 self._reflect_table()
 
     def _sync_columns(self, row, ensure, types=None):
@@ -514,7 +519,7 @@ class Table(object):
                 return
 
             self._threading_warn()
-            self.db.op.drop_column(self.table.name, name, self.table.schema)
+            self.db.op.drop_column(self.table.name, name, schema=self.table.schema)
             self._reflect_table()
 
     def drop(self):
@@ -525,7 +530,8 @@ class Table(object):
         with self.db.lock:
             if self.exists:
                 self._threading_warn()
-                self.table.drop(self.db.executable, checkfirst=True)
+                with self.db.engine.begin() as conn:
+                    self.table.drop(conn, checkfirst=True)
                 self._table = None
                 self._columns = None
                 self.db._tables.pop(self.name, None)
@@ -586,7 +592,8 @@ class Table(object):
                 kw["mysql_length"] = mysql_length
 
                 idx = Index(name, *columns, **kw)
-                idx.create(self.db.executable)
+                with self.db.engine.begin() as conn:
+                    idx.create(conn)
 
     def find(self, *_clauses, **kwargs):
         """Perform a simple search on the table.
@@ -630,7 +637,7 @@ class Table(object):
 
         order_by = self._args_to_order_by(order_by)
         args = self._args_to_clause(kwargs, clauses=_clauses)
-        query = self.table.select().where(args).limit(_limit).offset(_offset)
+        query = select(self.table).where(args).limit(_limit).offset(_offset)
         if len(order_by):
             query = query.order_by(*order_by)
 
@@ -708,8 +715,8 @@ class Table(object):
         if not len(columns):
             return iter([])
 
-        q = expression.select(*columns)\
-                      .distinct(True)\
+        q = select(*columns)\
+                      .distinct()\
                       .where(clause)\
                       .order_by(*(c.asc() for c in columns))
         return self.db.query(q)
